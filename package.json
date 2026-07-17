@@ -15,3 +15,10 @@
     "googleapis": "^173.0.0"
   }
 }
+{
+  "name": "mi-proyecto",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
