@@ -21,26 +21,51 @@ const SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis
 // Ejemplo: https://drive.google.com/drive/folders/1a2b3c4d5e6f7g8h9i0j
 const DRIVE_FOLDER_ID = '1G1yWE93Y3B37XQdQsRpT_d4RYMkAcTso';
 
-if (!fs.existsSync(OAUTH_CREDENTIALS_PATH)) {
-  console.error(`Falta ${OAUTH_CREDENTIALS_PATH}. Descárgalo desde Google Cloud Console (credenciales OAuth, tipo Aplicación de escritorio).`);
-  process.exit(1);
-}
-if (!fs.existsSync(TOKEN_PATH)) {
-  console.error('Falta token.json. Corre primero: node authorize.js');
+// --- Cargar credenciales: primero de archivo local (desarrollo); si no existe,
+// de variables de entorno (Render / producción). Así oauth-credentials.json y
+// token.json siguen fuera de Git (.gitignore) pero el backend igual funciona
+// en el servidor remoto, pegando su contenido como variables de entorno.
+function cargarJSON(rutaArchivo, nombreVarEntorno, descripcionError) {
+  if (fs.existsSync(rutaArchivo)) {
+    return JSON.parse(fs.readFileSync(rutaArchivo, 'utf8'));
+  }
+  const valorEnv = process.env[nombreVarEntorno];
+  if (valorEnv) {
+    try {
+      return JSON.parse(valorEnv);
+    } catch (e) {
+      console.error(`La variable de entorno ${nombreVarEntorno} no contiene JSON válido.`);
+      process.exit(1);
+    }
+  }
+  console.error(`Falta ${rutaArchivo} y tampoco existe la variable de entorno ${nombreVarEntorno}. ${descripcionError}`);
   process.exit(1);
 }
 
-const oauthKeys = JSON.parse(fs.readFileSync(OAUTH_CREDENTIALS_PATH, 'utf8'));
+const oauthKeys = cargarJSON(
+  OAUTH_CREDENTIALS_PATH,
+  'GOOGLE_OAUTH_CREDENTIALS',
+  'Descárgalo desde Google Cloud Console (credenciales OAuth, tipo Aplicación de escritorio) y pega su contenido en esa variable de entorno.'
+);
 const oauthCreds = oauthKeys.installed || oauthKeys.web;
 const auth = new google.auth.OAuth2(oauthCreds.client_id, oauthCreds.client_secret, 'http://localhost:4321');
-const savedTokens = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
+
+const savedTokens = cargarJSON(
+  TOKEN_PATH,
+  'GOOGLE_TOKEN',
+  'Corre primero "node authorize.js" en tu máquina y pega el contenido de token.json en esa variable de entorno.'
+);
 auth.setCredentials(savedTokens);
 
 // Cuando Google renueve el access_token automáticamente, lo volvemos a guardar en disco
-// para no tener que re-autorizar manualmente cada vez que expire.
+// (solo si estamos usando el archivo local; en Render el disco es efímero,
+// pero no hay problema porque el refresh_token no cambia y el access_token
+// se renueva solo en cada arranque del proceso).
 auth.on('tokens', (nuevosTokens) => {
   const combinado = { ...savedTokens, ...nuevosTokens };
-  fs.writeFileSync(TOKEN_PATH, JSON.stringify(combinado, null, 2));
+  if (fs.existsSync(OAUTH_CREDENTIALS_PATH)) {
+    fs.writeFileSync(TOKEN_PATH, JSON.stringify(combinado, null, 2));
+  }
 });
 
 const drive = google.drive({ version: 'v3', auth });
