@@ -1,0 +1,4 @@
+# Ignorar el archivo de credenciales de Google Cloud para no exponer claves privadas.
+credentials.json
+oauth-credentials.json
+token.json
