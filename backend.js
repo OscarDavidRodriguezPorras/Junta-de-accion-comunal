@@ -19,7 +19,7 @@ const SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis
 // ID de la carpeta en Google Drive donde se guardarán las jornadas.
 // Para obtenerlo, abre la carpeta en tu navegador y copia la última parte de la URL.
 // Ejemplo: https://drive.google.com/drive/folders/1a2b3c4d5e6f7g8h9i0j
-const DRIVE_FOLDER_ID = '1G1yWE93Y3B37XQdQsRpT_d4RYMkAcTso';
+const DRIVE_FOLDER_ID = '1j2Fgehy5osQvXP4qCQ_45L1yINmdox1M';
 
 // --- Cargar credenciales: primero de archivo local (desarrollo); si no existe,
 // de variables de entorno (Render / producción). Así oauth-credentials.json y
