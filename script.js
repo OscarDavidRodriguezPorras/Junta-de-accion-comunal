@@ -2,9 +2,13 @@
   const TIPO_ICONS = {};
   let jornadas = [];
   let asistentesTemp = [];
-  let fotosTemp = []; // { dataUrl, base64, mimeType, nombre }
+  let fotosTemp = []; // { dataUrl, base64, mimeType, nombre } — fotos NUEVAS a subir
+  let fotosExistentes = []; // { fileId, nombre } — fotos que YA estaban en Drive (modo edición)
+  let fotosAEliminar = []; // fileIds de fotosExistentes que el usuario quitó
+  let editandoId = null; // id del documento que se está editando, o null si es una jornada nueva
   let driveState = { conectado:false, correo:'', ultimaSync:null };
   let sincronizando = false;
+  let filtros = { texto:'', tipo:'', desde:'', hasta:'' };
 
   const $ = (sel, ctx=document) => ctx.querySelector(sel);
   const $$ = (sel, ctx=document) => Array.from(ctx.querySelectorAll(sel));
@@ -180,9 +184,10 @@
       $('#form-msg').textContent = 'Completa fecha, tipo de actividad y lugar.';
       return;
     }
+    const esEdicion = !!editandoId;
     $('#form-msg').textContent = '';
     $('#btn-guardar').disabled = true;
-    $('#btn-guardar').textContent = 'Registrando...';
+    $('#btn-guardar').textContent = esEdicion ? 'Guardando cambios...' : 'Registrando...';
 
     const jornada = {
       fecha,
@@ -193,10 +198,13 @@
       asistentes: asistentesFinal,
       evidencias: fotosTemp.map(f => ({ data: f.base64, mimeType: f.mimeType, nombre: f.nombre })),
     };
+    if (esEdicion) {
+      jornada.fotosEliminar = fotosAEliminar;
+    }
 
     try {
-      const response = await fetch('/api/jornadas', {
-        method: 'POST',
+      const response = await fetch(esEdicion ? `/api/jornadas/${editandoId}` : '/api/jornadas', {
+        method: esEdicion ? 'PUT' : 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(jornada)
       });
@@ -206,10 +214,11 @@
         const errorResult = await leerRespuesta(response);
         throw new Error(errorResult.message || 'Ocurrió un error desconocido en el servidor.');
       }
-      
+
       // Si la respuesta FUE exitosa, continuamos.
-      mostrarSello();
-      await cargarJornadas(); // Recargamos la lista para ver el nuevo registro.
+      if (!esEdicion) mostrarSello();
+      await cargarJornadas(); // Recargamos la lista para ver el registro nuevo/actualizado.
+      if (esEdicion) switchTab('historial');
     } catch (error) {
       $('#form-msg').textContent = `Error: ${error.message}`;
     } finally {
@@ -227,8 +236,71 @@
     $('#f-desc').value = '';
     asistentesTemp = [{nombre:'', cedula:''}];
     fotosTemp = [];
+    fotosExistentes = [];
+    fotosAEliminar = [];
+    editandoId = null;
+    $('#edit-banner').style.display = 'none';
+    $('#registrar-title').textContent = 'Datos de la jornada';
+    $('#btn-guardar').textContent = 'Registrar jornada';
     renderAsistentes();
     renderFotos();
+    renderFotosExistentes();
+  }
+
+  /* ---------- Edición de jornadas ---------- */
+  async function abrirEdicion(id){
+    try{
+      const response = await fetch(`/api/jornadas/${id}`);
+      const data = await leerRespuesta(response);
+      if(!response.ok) throw new Error(data.message || 'No se pudo cargar la jornada para editar.');
+
+      resetForm();
+      editandoId = id;
+      $('#f-fecha').value = data.fecha || '';
+      $('#f-tipo').value = data.tipo || '';
+      $('#f-lugar').value = data.lugar || '';
+      $('#f-responsable').value = data.responsable || '';
+      $('#f-desc').value = data.descripcion || '';
+      asistentesTemp = (data.asistentes && data.asistentes.length) ? data.asistentes.map(a=>({nombre:a.nombre||'', cedula:a.cedula||''})) : [{nombre:'', cedula:''}];
+      fotosExistentes = Array.isArray(data.fotos) ? data.fotos.slice() : [];
+      renderAsistentes();
+      renderFotosExistentes();
+
+      $('#edit-banner').style.display = 'flex';
+      $('#registrar-title').textContent = `Editando: ${data.tipo || 'jornada'}`;
+      $('#btn-guardar').textContent = 'Guardar cambios';
+      if(data.legado){
+        $('#form-msg').textContent = 'Esta jornada es de antes de tener edición completa: descripción y asistentes quedaron vacíos, pero puedes completarlos ahora.';
+      }
+      switchTab('registrar');
+      window.scrollTo({top:0, behavior:'smooth'});
+    }catch(error){
+      alert(`No se pudo abrir la jornada para editar: ${error.message}`);
+    }
+  }
+
+  $('#btn-cancelar-edicion').addEventListener('click', ()=>{
+    resetForm();
+    switchTab('historial');
+  });
+
+  function renderFotosExistentes(){
+    const wrap = $('#existentes-wrap');
+    wrap.innerHTML = '';
+    fotosExistentes.forEach(f=>{
+      const chip = document.createElement('div');
+      chip.className = 'chip-foto';
+      chip.innerHTML = `<span title="${escapeHtml(f.nombre)}">${escapeHtml(f.nombre)}</span><button data-rmexistente="${f.fileId}" title="Quitar foto">✕</button>`;
+      wrap.appendChild(chip);
+    });
+    $$('#existentes-wrap [data-rmexistente]').forEach(b=>{
+      b.addEventListener('click', ()=>{
+        const fid = b.dataset.rmexistente;
+        fotosAEliminar.push(fid);
+        fotosExistentes = fotosExistentes.filter(f=>f.fileId !== fid);
+        renderFotosExistentes();
+      });
+    });
   }
 
   function mostrarSello(){
@@ -278,6 +350,9 @@
       </div>
       <div class="badges">
         <!-- Los contadores de asistentes/fotos ya no están disponibles directamente, los quitamos -->
+        <button class="btn-editar" data-edit="${j.id}" title="Editar">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
+        </button>
         <button class="btn-del" data-del="${j.id}" title="Eliminar">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m2 0v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V6h12z"/></svg>
         </button>
@@ -288,25 +363,54 @@
     return (s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
+  function actualizarOpcionesFiltroTipo(){
+    const sel = $('#filtro-tipo');
+    const valorActual = sel.value;
+    const tiposUnicos = Array.from(new Set(jornadas.map(j=>j.titulo).filter(Boolean))).sort();
+    sel.innerHTML = '<option value="">Todas</option>' + tiposUnicos.map(t=>`<option value="${escapeHtml(t)}">${escapeHtml(t)}</option>`).join('');
+    if(tiposUnicos.includes(valorActual)) sel.value = valorActual;
+  }
+
+  function jornadasFiltradas(){
+    const texto = filtros.texto.trim().toLowerCase();
+    return jornadas.filter(j=>{
+      if(filtros.tipo && j.titulo !== filtros.tipo) return false;
+      if(filtros.desde && j.fecha && j.fecha < filtros.desde) return false;
+      if(filtros.hasta && j.fecha && j.fecha > filtros.hasta) return false;
+      if(texto){
+        const campos = [j.titulo, j.lugar, j.responsable].join(' ').toLowerCase();
+        if(!campos.includes(texto)) return false;
+      }
+      return true;
+    });
+  }
+
   function render(){
     // stats
     $('#stat-jornadas').textContent = jornadas.length;
     // Ya no tenemos estos datos directamente, mostramos 'N/A'
     $('#stat-asistentes').textContent = 'N/A';
 
-    // inicio: últimas 5
+    // inicio: últimas 5 (sin filtrar)
     const inicioList = $('#inicio-list');
     const recientes = jornadas.slice(0,5);
     inicioList.innerHTML = recientes.length ? recientes.map(hojaHTML).join('') : emptyStateHTML('inicio');
 
-    // historial completo
+    // historial: aplicando los filtros activos
+    actualizarOpcionesFiltroTipo();
+    const filtradas = jornadasFiltradas();
     const histList = $('#historial-list');
-    histList.innerHTML = jornadas.length ? jornadas.map(hojaHTML).join('') : emptyStateHTML('historial');
+    histList.innerHTML = filtradas.length ? filtradas.map(hojaHTML).join('') : emptyStateHTML('historial');
+
+    const hayFiltrosActivos = filtros.texto || filtros.tipo || filtros.desde || filtros.hasta;
+    $('#filtro-count').textContent = hayFiltrosActivos
+      ? `Mostrando ${filtradas.length} de ${jornadas.length} jornadas`
+      : (jornadas.length ? `${jornadas.length} jornada${jornadas.length===1?'':'s'} en total` : '');
 
     // listeners
     $$('.hoja[data-open-link]').forEach(el=>{
       el.addEventListener('click', (e)=>{
-        if(e.target.closest('[data-del]')) return;
+        if(e.target.closest('[data-del]') || e.target.closest('[data-edit]')) return;
         // Abrimos el enlace del documento en una nueva pestaña.
         window.open(el.dataset.openLink, '_blank');
       });
@@ -314,7 +418,24 @@
     $$('[data-del]').forEach(b=>{
       b.addEventListener('click', (e)=>{ e.stopPropagation(); eliminarJornada(b.dataset.del); });
     });
+    $$('[data-edit]').forEach(b=>{
+      b.addEventListener('click', (e)=>{ e.stopPropagation(); abrirEdicion(b.dataset.edit); });
+    });
   }
+
+  /* ---------- Filtros del historial ---------- */
+  $('#filtro-texto').addEventListener('input', e=>{ filtros.texto = e.target.value; render(); });
+  $('#filtro-tipo').addEventListener('change', e=>{ filtros.tipo = e.target.value; render(); });
+  $('#filtro-desde').addEventListener('change', e=>{ filtros.desde = e.target.value; render(); });
+  $('#filtro-hasta').addEventListener('change', e=>{ filtros.hasta = e.target.value; render(); });
+  $('#filtro-limpiar').addEventListener('click', ()=>{
+    filtros = { texto:'', tipo:'', desde:'', hasta:'' };
+    $('#filtro-texto').value = '';
+    $('#filtro-tipo').value = '';
+    $('#filtro-desde').value = '';
+    $('#filtro-hasta').value = '';
+    render();
+  });
 
   function emptyStateHTML(origen){
     return `<div class="empty-state">
@@ -336,8 +457,3 @@
   resetForm();
   cargarJornadas();
 })();
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Servidor corriendo en el puerto ${PORT}`);
-});

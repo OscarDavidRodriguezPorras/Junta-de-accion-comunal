@@ -55,8 +55,12 @@
 
   <!-- ================= REGISTRAR ================= -->
   <div class="panel" id="panel-registrar">
+    <div class="edit-banner" id="edit-banner" style="display:none">
+      <span>✏️ Editando una jornada existente</span>
+      <button class="add-link" id="btn-cancelar-edicion" type="button">Cancelar edición</button>
+    </div>
     <section>
-      <h2 class="section-title">Datos de la jornada</h2>
+      <h2 class="section-title" id="registrar-title">Datos de la jornada</h2>
       <div class="field-row">
         <div class="field">
           <label for="f-fecha">Fecha</label>
@@ -106,6 +110,7 @@
         <div>Arrastra fotos aquí o haz clic para seleccionarlas</div>
       </div>
       <input type="file" id="f-fotos" accept="image/*" multiple style="display:none">
+      <div class="existentes-wrap" id="existentes-wrap"></div>
       <div class="thumbs" id="thumbs-wrap"></div>
     </section>
 
@@ -119,6 +124,28 @@
   <div class="panel" id="panel-historial">
     <section>
       <h2 class="section-title">Historial completo</h2>
+      <div class="filter-bar">
+        <div class="field" style="margin-bottom:0">
+          <label for="filtro-texto">Buscar</label>
+          <input type="text" id="filtro-texto" placeholder="Tipo, lugar o responsable...">
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="filtro-tipo">Tipo de actividad</label>
+          <select id="filtro-tipo">
+            <option value="">Todas</option>
+          </select>
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="filtro-desde">Desde</label>
+          <input type="date" id="filtro-desde">
+        </div>
+        <div class="field" style="margin-bottom:0">
+          <label for="filtro-hasta">Hasta</label>
+          <input type="date" id="filtro-hasta">
+        </div>
+        <button class="btn-secondary" id="filtro-limpiar" type="button">Limpiar filtros</button>
+      </div>
+      <div class="filter-count" id="filtro-count"></div>
       <div class="hoja-list" id="historial-list"></div>
     </section>
   </div>

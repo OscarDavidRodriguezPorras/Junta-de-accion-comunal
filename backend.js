@@ -81,32 +81,62 @@ function mensajeErrorGoogle(error) {
   );
 }
 
-// Sube una foto (base64) a una subcarpeta "Evidencias" dentro de DRIVE_FOLDER_ID,
-// la hace públicamente visible por un momento (necesario para que Docs pueda "descargarla"
-// e incrustarla), y devuelve el fileId + el permissionId público, para poder revertirlo después.
-async function subirFotoTemporalmentePublica(base64Data, mimeType, nombreArchivo, carpetaId) {
+/* ======================================================================
+   Helpers de Drive/Docs reutilizados por crear (POST) y editar (PUT)
+   ====================================================================== */
+
+// Sube una foto nueva (base64) a una carpeta de Drive. No la hace pública;
+// eso se hace aparte con hacerPublicaTemporalmente() solo cuando haga falta.
+async function subirFotoNueva(base64Data, mimeType, nombreArchivo, carpetaId) {
   const buffer = Buffer.from(base64Data, 'base64');
   const archivo = await drive.files.create({
     requestBody: { name: nombreArchivo, parents: [carpetaId] },
     media: { mimeType, body: Readable.from(buffer) },
     fields: 'id',
   });
-  const fileId = archivo.data.id;
+  return archivo.data.id;
+}
 
+// Da acceso público de lectura a un archivo ya existente en Drive (necesario
+// para que Google Docs pueda "descargarlo" e incrustarlo en el documento).
+async function hacerPublicaTemporalmente(fileId) {
   const permiso = await drive.permissions.create({
     fileId,
     requestBody: { role: 'reader', type: 'anyone' },
     fields: 'id',
   });
-
   const uri = `https://drive.google.com/uc?export=view&id=${fileId}`;
-  return { fileId, permissionId: permiso.data.id, uri };
+  return { permissionId: permiso.data.id, uri };
 }
 
-// Busca (o crea) la subcarpeta "Evidencias/<docTitle>" dentro de la carpeta principal,
+// Revierte el acceso público de una foto. Nunca lanza error: si falla, solo
+// queda registrado en consola, para no tumbar la respuesta al usuario.
+async function quitarAccesoPublico(fileId, permissionId) {
+  try {
+    await drive.permissions.delete({ fileId, permissionId });
+  } catch (err) {
+    console.error(`No se pudo revertir el acceso público del archivo ${fileId}:`, mensajeErrorGoogle(err));
+  }
+}
+
+// Busca una carpeta por nombre exacto dentro de la carpeta principal. Devuelve su id o null.
+async function buscarCarpetaEvidencias(nombreCarpeta) {
+  const busqueda = await drive.files.list({
+    q: `'${DRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder' and name='${nombreCarpeta.replace(/'/g, "\\'")}' and trashed=false`,
+    fields: 'files(id, name)',
+    supportsAllDrives: true,
+    includeItemsFromAllDrives: true,
+    corpora: 'allDrives',
+  });
+  return busqueda.data.files.length ? busqueda.data.files[0].id : null;
+}
+
+// Busca (o crea) la subcarpeta "Evidencias_<docTitle>" dentro de la carpeta principal,
 // para no mezclar las fotos originales sueltas con los documentos de jornadas.
-async function obtenerCarpetaEvidencias(docTitle) {
+async function obtenerOCrearCarpetaEvidencias(docTitle) {
   const nombreCarpeta = `Evidencias_${docTitle}`;
+  const existente = await buscarCarpetaEvidencias(nombreCarpeta);
+  if (existente) return existente;
   const carpeta = await drive.files.create({
     requestBody: {
       name: nombreCarpeta,
@@ -116,6 +146,132 @@ async function obtenerCarpetaEvidencias(docTitle) {
     fields: 'id',
   });
   return carpeta.data.id;
+}
+
+// Si el título de la jornada cambió (por editar fecha o tipo), renombra su carpeta
+// de evidencias para que coincida. Devuelve el id de la carpeta si existe, o null.
+async function renombrarCarpetaEvidenciasSiExiste(oldDocTitle, newDocTitle) {
+  if (oldDocTitle === newDocTitle) {
+    return buscarCarpetaEvidencias(`Evidencias_${newDocTitle}`);
+  }
+  const folderId = await buscarCarpetaEvidencias(`Evidencias_${oldDocTitle}`);
+  if (!folderId) return null;
+  await drive.files.update({ fileId: folderId, requestBody: { name: `Evidencias_${newDocTitle}` } });
+  return folderId;
+}
+
+// Lee y parsea un archivo JSON guardado en Drive (usado para el meta.json de cada jornada).
+async function leerArchivoJSON(fileId) {
+  const resp = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'json' });
+  return resp.data;
+}
+
+// Carpeta oculta "_datos" donde se guardan los archivos de metadatos (.meta_*.json) de
+// cada jornada, para no mezclarlos visualmente con los documentos y evidencias.
+// Se busca/crea una sola vez y se guarda en memoria para no repetir la búsqueda en cada petición.
+let carpetaDatosIdCache = null;
+async function obtenerCarpetaDatos() {
+  if (carpetaDatosIdCache) return carpetaDatosIdCache;
+  const existente = await buscarCarpetaEvidencias('_datos');
+  if (existente) {
+    carpetaDatosIdCache = existente;
+    return existente;
+  }
+  const carpeta = await drive.files.create({
+    requestBody: { name: '_datos', mimeType: 'application/vnd.google-apps.folder', parents: [DRIVE_FOLDER_ID] },
+    fields: 'id',
+  });
+  carpetaDatosIdCache = carpeta.data.id;
+  return carpetaDatosIdCache;
+}
+
+async function crearArchivoJSON(nombre, objeto, parentId) {
+  const buffer = Buffer.from(JSON.stringify(objeto), 'utf8');
+  const archivo = await drive.files.create({
+    requestBody: { name: nombre, parents: [parentId] },
+    media: { mimeType: 'application/json', body: Readable.from(buffer) },
+    fields: 'id',
+  });
+  return archivo.data.id;
+}
+
+async function actualizarArchivoJSON(fileId, objeto) {
+  const buffer = Buffer.from(JSON.stringify(objeto), 'utf8');
+  await drive.files.update({
+    fileId,
+    media: { mimeType: 'application/json', body: Readable.from(buffer) },
+  });
+}
+
+// Construye la lista de "requests" para escribir el contenido de una jornada en un
+// Google Doc (título, metadatos, descripción, asistentes y fotos ya incrustables).
+// `fotosConUri` = [{ uri, nombre }] de fotos que YA están públicas temporalmente.
+function construirRequestsContenido(datos, fotosConUri) {
+  const requests = [];
+  let currentIndex = 1;
+
+  const titleText = `Jornada: ${datos.tipo}\n`;
+  requests.push({ insertText: { location: { index: currentIndex }, text: titleText } });
+  requests.push({
+    updateParagraphStyle: {
+      range: { startIndex: currentIndex, endIndex: currentIndex + titleText.length - 1 },
+      fields: 'namedStyleType',
+      paragraphStyle: { namedStyleType: 'TITLE' },
+    },
+  });
+  currentIndex += titleText.length;
+
+  const metaText = `Fecha: ${datos.fecha}\nLugar: ${datos.lugar}\nResponsable: ${datos.responsable || 'No especificado'}\n\n`;
+  requests.push({ insertText: { location: { index: currentIndex }, text: metaText } });
+  currentIndex += metaText.length;
+
+  const descText = `Descripción:\n${datos.descripcion || 'Sin descripción.'}\n\n`;
+  requests.push({ insertText: { location: { index: currentIndex }, text: descText } });
+  currentIndex += descText.length;
+
+  const asistentesText =
+    `Asistentes (${datos.asistentes.length}):\n` +
+    datos.asistentes.map(a => `\t- ${a.nombre} (C.C: ${a.cedula || 'N/A'})\n`).join('');
+  requests.push({ insertText: { location: { index: currentIndex }, text: asistentesText } });
+  currentIndex += asistentesText.length;
+
+  if (fotosConUri.length > 0) {
+    const encabezadoText = `\nEvidencias fotográficas (${fotosConUri.length}):\n`;
+    requests.push({ insertText: { location: { index: currentIndex }, text: encabezadoText } });
+    currentIndex += encabezadoText.length;
+
+    for (const foto of fotosConUri) {
+      requests.push({ insertText: { location: { index: currentIndex }, text: '\n' } });
+      currentIndex += 1;
+
+      requests.push({
+        insertInlineImage: {
+          location: { index: currentIndex },
+          uri: foto.uri,
+          objectSize: {
+            height: { magnitude: 220, unit: 'PT' },
+            width: { magnitude: 293, unit: 'PT' },
+          },
+        },
+      });
+      currentIndex += 1;
+    }
+  }
+
+  return requests;
+}
+
+// Vacía por completo el cuerpo de un documento (usado al editar, antes de reescribirlo).
+async function limpiarDocumento(documentId) {
+  const doc = await docs.documents.get({ documentId, fields: 'body(content(endIndex))' });
+  const content = doc.data.body.content || [];
+  const endIndex = content.length ? content[content.length - 1].endIndex : 1;
+  if (endIndex > 2) {
+    await docs.documents.batchUpdate({
+      documentId,
+      requestBody: { requests: [{ deleteContentRange: { range: { startIndex: 1, endIndex: endIndex - 1 } } }] },
+    });
+  }
 }
 
 // --- Middlewares ---
@@ -133,15 +289,15 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
-// --- Rutas de la API (simuladas) ---
+// --- Rutas de la API ---
 
-// Endpoint para obtener todas las jornadas
+// Endpoint para obtener todas las jornadas (listado resumido)
 app.get('/api/jornadas', async (req, res) => {
   console.log('Se solicitaron las jornadas');
   try {
     const response = await drive.files.list({
       q: `'${DRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.document' and trashed=false`,
-      fields: 'files(id, name, createdTime, webViewLink)',
+      fields: 'files(id, name, createdTime, webViewLink, properties)',
       orderBy: 'createdTime desc',
       supportsAllDrives: true,
       includeItemsFromAllDrives: true,
@@ -149,11 +305,14 @@ app.get('/api/jornadas', async (req, res) => {
     });
 
     const jornadas = response.data.files.map(file => {
-      const [fecha, tipo] = file.name.split('_');
+      const [fecha, tipoSlug] = file.name.split('_');
+      const props = file.properties || {};
       return {
         id: file.id,
-        titulo: (tipo || 'Sin tipo').replace(/-/g, ' '),
+        titulo: (tipoSlug || 'Sin tipo').replace(/-/g, ' '),
         fecha: fecha,
+        lugar: props.lugar || '',
+        responsable: props.responsable || '',
         creado: file.createdTime,
         enlace: file.webViewLink, // Enlace para ver el documento en el navegador
       };
@@ -167,25 +326,72 @@ app.get('/api/jornadas', async (req, res) => {
   }
 });
 
+// Endpoint para obtener el detalle completo de una jornada (usado al editar)
+app.get('/api/jornadas/:id', async (req, res) => {
+  const { id } = req.params;
+  console.log(`Se solicitó el detalle de la jornada ${id}`);
+  try {
+    const archivo = await drive.files.get({
+      fileId: id,
+      fields: 'id, name, properties',
+      supportsAllDrives: true,
+    });
+    const props = archivo.data.properties || {};
+
+    if (props.metaFileId) {
+      try {
+        const meta = await leerArchivoJSON(props.metaFileId);
+        return res.json({
+          id,
+          fecha: meta.fecha,
+          tipo: meta.tipo,
+          lugar: meta.lugar,
+          responsable: meta.responsable || '',
+          descripcion: meta.descripcion || '',
+          asistentes: meta.asistentes || [],
+          fotos: meta.fotos || [],
+        });
+      } catch (err) {
+        console.error('No se pudo leer el archivo de metadatos, se usará información básica del nombre:', mensajeErrorGoogle(err));
+      }
+    }
+
+    // Jornada creada antes de tener esta función (o sin metadatos disponibles):
+    // reconstruimos lo poco que se puede saber a partir del nombre del archivo.
+    const [fecha, tipoSlug] = archivo.data.name.split('_');
+    res.json({
+      id,
+      fecha: fecha || '',
+      tipo: (tipoSlug || '').replace(/-/g, ' '),
+      lugar: props.lugar || '',
+      responsable: props.responsable || '',
+      descripcion: '',
+      asistentes: [],
+      fotos: [],
+      legado: true,
+    });
+  } catch (error) {
+    const msg = mensajeErrorGoogle(error);
+    console.error('Error al obtener la jornada:', msg, error);
+    res.status(500).json({ message: `Error al obtener la jornada: ${msg}` });
+  }
+});
+
 // Endpoint para crear una nueva jornada
 app.post('/api/jornadas', async (req, res) => {
   const nuevaJornada = req.body;
   console.log('Se recibió una nueva jornada para registrar:', nuevaJornada.tipo);
 
-  // --- Validación de Datos (Mejora) ---
   if (!nuevaJornada.fecha || !nuevaJornada.tipo || !nuevaJornada.lugar) {
     console.log('Petición rechazada: Faltan datos básicos.');
     return res.status(400).json({ message: 'Faltan datos obligatorios (fecha, tipo o lugar).' });
   }
 
-  // 1. Crear un título para el documento
   const docTitle = `${nuevaJornada.fecha}_${nuevaJornada.tipo.replace(/ /g, '-')}`;
+  const permisosParaRevertir = []; // { fileId, permissionId }
 
   try {
-    // 2. Crear el documento DIRECTAMENTE dentro de la carpeta compartida usando la API de Drive.
-    // (Antes se creaba con docs.documents.create(), pero eso crea el archivo en el espacio propio
-    // de la cuenta de servicio -que no tiene cuota propia- y fallaba con "permission denied"
-    // antes de llegar a moverlo a la carpeta. Creándolo ya con `parents` evita ese problema.)
+    // 1. Crear el documento DIRECTAMENTE dentro de la carpeta compartida usando la API de Drive.
     console.log(`Creando documento: ${docTitle}`);
     const nuevoArchivo = await drive.files.create({
       requestBody: {
@@ -199,103 +405,219 @@ app.post('/api/jornadas', async (req, res) => {
     const documentId = nuevoArchivo.data.id;
     console.log(`Documento creado con ID: ${documentId}`);
 
-    // 3. Preparar las peticiones para escribir en el documento (en orden)
-    const requests = [];
-    let currentIndex = 1;
-
-    // Título
-    const titleText = `Jornada: ${nuevaJornada.tipo}\n`;
-    requests.push({ insertText: { location: { index: currentIndex }, text: titleText } });
-    requests.push({ updateParagraphStyle: { range: { startIndex: currentIndex, endIndex: currentIndex + titleText.length -1 }, fields: 'namedStyleType', paragraphStyle: { namedStyleType: 'TITLE' } } });
-    currentIndex += titleText.length;
-
-    // Metadatos
-    const metaText = `Fecha: ${nuevaJornada.fecha}\nLugar: ${nuevaJornada.lugar}\nResponsable: ${nuevaJornada.responsable || 'No especificado'}\n\n`;
-    requests.push({ insertText: { location: { index: currentIndex }, text: metaText } });
-    currentIndex += metaText.length;
-
-    // Descripción
-    const descText = `Descripción:\n${nuevaJornada.descripcion || 'Sin descripción.'}\n\n`;
-    requests.push({ insertText: { location: { index: currentIndex }, text: descText } });
-    currentIndex += descText.length;
-
-    // Asistentes
-    const asistentesText = `Asistentes (${nuevaJornada.asistentes.length}):\n` + nuevaJornada.asistentes.map(a => `\t- ${a.nombre} (C.C: ${a.cedula || 'N/A'})\n`).join('');
-    requests.push({ insertText: { location: { index: currentIndex }, text: asistentesText } });
-    currentIndex += asistentesText.length;
-
-    // Evidencias fotográficas (opcional): nuevaJornada.evidencias = [{ data, mimeType, nombre }, ...]
-    // "data" viene en base64 (sin el prefijo "data:image/...;base64,").
-    const fotosSubidas = []; // { fileId, permissionId } — para revertir el acceso público al final
+    const asistentes = Array.isArray(nuevaJornada.asistentes) ? nuevaJornada.asistentes : [];
     const evidencias = Array.isArray(nuevaJornada.evidencias) ? nuevaJornada.evidencias : [];
 
+    // 2. Subir las fotos (si hay) y prepararlas para incrustarlas en el documento.
+    const fotosFinal = []; // { fileId, nombre } — esto se guarda en meta.json
+    const fotosConUri = []; // { uri, nombre } — para construir el documento
     if (evidencias.length > 0) {
       console.log(`Subiendo ${evidencias.length} foto(s) de evidencia...`);
-      const carpetaEvidenciasId = await obtenerCarpetaEvidencias(docTitle);
-
-      const encabezadoText = `\nEvidencias fotográficas (${evidencias.length}):\n`;
-      requests.push({ insertText: { location: { index: currentIndex }, text: encabezadoText } });
-      currentIndex += encabezadoText.length;
-
+      const carpetaEvidenciasId = await obtenerOCrearCarpetaEvidencias(docTitle);
       for (let i = 0; i < evidencias.length; i++) {
         const foto = evidencias[i];
         const nombreArchivo = foto.nombre || `evidencia_${i + 1}.jpg`;
-        const { fileId, permissionId, uri } = await subirFotoTemporalmentePublica(
-          foto.data,
-          foto.mimeType || 'image/jpeg',
-          nombreArchivo,
-          carpetaEvidenciasId
-        );
-        fotosSubidas.push({ fileId, permissionId });
-
-        // Salto de línea antes de cada imagen
-        requests.push({ insertText: { location: { index: currentIndex }, text: '\n' } });
-        currentIndex += 1;
-
-        requests.push({
-          insertInlineImage: {
-            location: { index: currentIndex },
-            uri,
-            objectSize: {
-              height: { magnitude: 220, unit: 'PT' },
-              width: { magnitude: 293, unit: 'PT' },
-            },
-          },
-        });
-        currentIndex += 1; // una imagen incrustada cuenta como una posición de índice
+        const fileId = await subirFotoNueva(foto.data, foto.mimeType || 'image/jpeg', nombreArchivo, carpetaEvidenciasId);
+        const { permissionId, uri } = await hacerPublicaTemporalmente(fileId);
+        permisosParaRevertir.push({ fileId, permissionId });
+        fotosFinal.push({ fileId, nombre: nombreArchivo });
+        fotosConUri.push({ uri, nombre: nombreArchivo });
       }
     }
 
-    // 4. Escribir el contenido en el documento
+    // 3. Escribir el contenido en el documento
     console.log('Escribiendo contenido en el documento...');
-    await docs.documents.batchUpdate({
-      documentId: documentId,
+    const datos = {
+      tipo: nuevaJornada.tipo,
+      fecha: nuevaJornada.fecha,
+      lugar: nuevaJornada.lugar,
+      responsable: nuevaJornada.responsable,
+      descripcion: nuevaJornada.descripcion,
+      asistentes,
+    };
+    const requests = construirRequestsContenido(datos, fotosConUri);
+    await docs.documents.batchUpdate({ documentId, requestBody: { requests } });
+
+    // 4. Guardar los metadatos completos en un archivo aparte, para poder editar la
+    // jornada más adelante sin depender de volver a leer el texto del documento.
+    const meta = {
+      fecha: nuevaJornada.fecha,
+      tipo: nuevaJornada.tipo,
+      lugar: nuevaJornada.lugar,
+      responsable: nuevaJornada.responsable || '',
+      descripcion: nuevaJornada.descripcion || '',
+      asistentes,
+      fotos: fotosFinal,
+    };
+    const metaFileId = await crearArchivoJSON(`.meta_${documentId}.json`, meta, await obtenerCarpetaDatos());
+
+    // 5. Guardar una referencia al archivo de metadatos y algunos datos cortos en el propio
+    // documento (como propiedades), para poder mostrarlos en el listado sin leer cada meta.json.
+    await drive.files.update({
+      fileId: documentId,
       requestBody: {
-        requests: requests,
+        properties: {
+          metaFileId,
+          lugar: nuevaJornada.lugar.slice(0, 120),
+          responsable: (nuevaJornada.responsable || '').slice(0, 120),
+        },
       },
+      supportsAllDrives: true,
     });
 
-    // 5. Ya no hace falta mover el documento: se creó directamente dentro de la carpeta correcta.
-
     // 6. Revertir el acceso público de las fotos: Docs ya las descargó e incrustó como copia
-    // dentro del documento, así que no necesitan seguir siendo públicas. Si algo falla aquí,
-    // solo lo dejamos registrado en consola — no debe tumbar la respuesta al usuario, porque
-    // el documento ya se creó correctamente.
-    for (const { fileId, permissionId } of fotosSubidas) {
-      try {
-        await drive.permissions.delete({ fileId, permissionId });
-      } catch (err) {
-        console.error(`No se pudo revertir el acceso público de la foto ${fileId}:`, mensajeErrorGoogle(err));
-      }
+    // dentro del documento, así que no necesitan seguir siendo públicas.
+    for (const { fileId, permissionId } of permisosParaRevertir) {
+      await quitarAccesoPublico(fileId, permissionId);
     }
 
     console.log('¡Proceso completado con éxito!');
-    res.status(201).json({ message: 'Jornada registrada y guardada en Google Drive con éxito', documentId: documentId });
-
+    res.status(201).json({ message: 'Jornada registrada y guardada en Google Drive con éxito', documentId });
   } catch (error) {
     const msg = mensajeErrorGoogle(error);
     console.error('Error al crear el documento en Google:', msg, error);
+    for (const { fileId, permissionId } of permisosParaRevertir) {
+      await quitarAccesoPublico(fileId, permissionId);
+    }
     res.status(500).json({ message: `Error al guardar la jornada en Google Drive: ${msg}` });
+  }
+});
+
+// Endpoint para editar una jornada existente
+app.put('/api/jornadas/:id', async (req, res) => {
+  const { id } = req.params;
+  const cambios = req.body;
+  console.log(`Solicitud para editar la jornada ${id}`);
+
+  if (!cambios.fecha || !cambios.tipo || !cambios.lugar) {
+    return res.status(400).json({ message: 'Faltan datos obligatorios (fecha, tipo o lugar).' });
+  }
+
+  const permisosParaRevertir = []; // { fileId, permissionId }
+
+  try {
+    const archivo = await drive.files.get({
+      fileId: id,
+      fields: 'id, name, properties',
+      supportsAllDrives: true,
+    });
+    const props = archivo.data.properties || {};
+    let metaFileId = props.metaFileId || null;
+
+    let oldDocTitle = archivo.data.name;
+    let fotosExistentes = []; // { fileId, nombre }
+    if (metaFileId) {
+      try {
+        const metaVieja = await leerArchivoJSON(metaFileId);
+        oldDocTitle = `${metaVieja.fecha}_${(metaVieja.tipo || '').replace(/ /g, '-')}`;
+        fotosExistentes = Array.isArray(metaVieja.fotos) ? metaVieja.fotos : [];
+      } catch (err) {
+        console.error('No se pudo leer el meta.json anterior, se continúa sin sus fotos previas:', mensajeErrorGoogle(err));
+      }
+    }
+
+    const newDocTitle = `${cambios.fecha}_${cambios.tipo.replace(/ /g, '-')}`;
+
+    // 1. Borrar de Drive las fotos que el usuario quitó explícitamente en el formulario.
+    const idsAEliminar = new Set(Array.isArray(cambios.fotosEliminar) ? cambios.fotosEliminar : []);
+    for (const fotoId of idsAEliminar) {
+      try {
+        await drive.files.delete({ fileId: fotoId, supportsAllDrives: true });
+      } catch (err) {
+        console.error(`No se pudo eliminar la foto ${fotoId}:`, mensajeErrorGoogle(err));
+      }
+    }
+    const fotosMantenidas = fotosExistentes.filter(f => !idsAEliminar.has(f.fileId));
+
+    // 2. Subir las fotos nuevas que se hayan agregado, y de paso renombrar la carpeta de
+    // evidencias si cambió el título de la jornada (fecha o tipo de actividad).
+    const evidenciasNuevas = Array.isArray(cambios.evidencias) ? cambios.evidencias : [];
+    const fotosNuevas = [];
+    if (evidenciasNuevas.length > 0) {
+      const carpetaEvidenciasId =
+        (await renombrarCarpetaEvidenciasSiExiste(oldDocTitle, newDocTitle)) ||
+        (await obtenerOCrearCarpetaEvidencias(newDocTitle));
+      for (let i = 0; i < evidenciasNuevas.length; i++) {
+        const foto = evidenciasNuevas[i];
+        const nombreArchivo = foto.nombre || `evidencia_${i + 1}.jpg`;
+        const fileId = await subirFotoNueva(foto.data, foto.mimeType || 'image/jpeg', nombreArchivo, carpetaEvidenciasId);
+        fotosNuevas.push({ fileId, nombre: nombreArchivo });
+      }
+    } else if (oldDocTitle !== newDocTitle) {
+      await renombrarCarpetaEvidenciasSiExiste(oldDocTitle, newDocTitle);
+    }
+
+    const fotosFinal = fotosMantenidas.concat(fotosNuevas);
+
+    // 3. Hacer públicas temporalmente TODAS las fotos finales (las que se mantienen +
+    // las nuevas) para poder reconstruir el documento con todas incrustadas.
+    const fotosConUri = [];
+    for (const foto of fotosFinal) {
+      const { permissionId, uri } = await hacerPublicaTemporalmente(foto.fileId);
+      permisosParaRevertir.push({ fileId: foto.fileId, permissionId });
+      fotosConUri.push({ uri, nombre: foto.nombre });
+    }
+
+    // 4. Vaciar el documento y reescribirlo desde cero con los datos actualizados.
+    await limpiarDocumento(id);
+    const asistentes = Array.isArray(cambios.asistentes) ? cambios.asistentes : [];
+    const datos = {
+      tipo: cambios.tipo,
+      fecha: cambios.fecha,
+      lugar: cambios.lugar,
+      responsable: cambios.responsable,
+      descripcion: cambios.descripcion,
+      asistentes,
+    };
+    const requests = construirRequestsContenido(datos, fotosConUri);
+    await docs.documents.batchUpdate({ documentId: id, requestBody: { requests } });
+
+    // 5. Renombrar el documento si cambió la fecha o el tipo de actividad.
+    if (oldDocTitle !== newDocTitle) {
+      await drive.files.update({ fileId: id, requestBody: { name: newDocTitle }, supportsAllDrives: true });
+    }
+
+    // 6. Guardar/actualizar el archivo de metadatos con los datos nuevos.
+    const metaNueva = {
+      fecha: cambios.fecha,
+      tipo: cambios.tipo,
+      lugar: cambios.lugar,
+      responsable: cambios.responsable || '',
+      descripcion: cambios.descripcion || '',
+      asistentes,
+      fotos: fotosFinal,
+    };
+    if (metaFileId) {
+      await actualizarArchivoJSON(metaFileId, metaNueva);
+    } else {
+      metaFileId = await crearArchivoJSON(`.meta_${id}.json`, metaNueva, await obtenerCarpetaDatos());
+    }
+    await drive.files.update({
+      fileId: id,
+      requestBody: {
+        properties: {
+          metaFileId,
+          lugar: cambios.lugar.slice(0, 120),
+          responsable: (cambios.responsable || '').slice(0, 120),
+        },
+      },
+      supportsAllDrives: true,
+    });
+
+    // 7. Revertir el acceso público de las fotos.
+    for (const { fileId, permissionId } of permisosParaRevertir) {
+      await quitarAccesoPublico(fileId, permissionId);
+    }
+
+    console.log('Jornada actualizada con éxito.');
+    res.json({ message: 'Jornada actualizada con éxito.', documentId: id });
+  } catch (error) {
+    const msg = mensajeErrorGoogle(error);
+    console.error('Error al editar la jornada:', msg, error);
+    for (const { fileId, permissionId } of permisosParaRevertir) {
+      await quitarAccesoPublico(fileId, permissionId);
+    }
+    res.status(500).json({ message: `Error al actualizar la jornada: ${msg}` });
   }
 });
 
@@ -304,42 +626,45 @@ app.delete('/api/jornadas/:id', async (req, res) => {
   const { id } = req.params;
   console.log(`Solicitud para eliminar el documento con ID: ${id}`);
   try {
-    // 1. Averiguar el nombre del documento (ej: "2025-01-15_Aseo-y-ornato") para poder
-    // encontrar su carpeta de evidencias, que se llama "Evidencias_<ese mismo nombre>".
+    // 1. Averiguar el nombre del documento y su archivo de metadatos (si tiene).
     let docTitle = null;
+    let metaFileId = null;
     try {
       const archivo = await drive.files.get({
         fileId: id,
-        fields: 'name',
+        fields: 'name, properties',
         supportsAllDrives: true,
       });
       docTitle = archivo.data.name;
+      metaFileId = archivo.data.properties ? archivo.data.properties.metaFileId : null;
     } catch (err) {
-      console.error(`No se pudo obtener el nombre del documento ${id} (puede que ya no exista):`, mensajeErrorGoogle(err));
+      console.error(`No se pudo obtener información del documento ${id} (puede que ya no exista):`, mensajeErrorGoogle(err));
     }
 
-    // 2. Buscar y borrar la carpeta "Evidencias_<docTitle>" dentro de la carpeta principal, si existe.
+    // 2. Borrar la carpeta "Evidencias_<docTitle>" dentro de la carpeta principal, si existe.
     if (docTitle) {
-      const nombreCarpeta = `Evidencias_${docTitle}`;
       try {
-        const busqueda = await drive.files.list({
-          q: `'${DRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder' and name='${nombreCarpeta.replace(/'/g, "\\'")}' and trashed=false`,
-          fields: 'files(id, name)',
-          supportsAllDrives: true,
-          includeItemsFromAllDrives: true,
-          corpora: 'allDrives',
-        });
-        for (const carpeta of busqueda.data.files) {
-          console.log(`Eliminando carpeta de evidencias: ${carpeta.name} (${carpeta.id})`);
-          await drive.files.delete({ fileId: carpeta.id, supportsAllDrives: true });
+        const carpetaId = await buscarCarpetaEvidencias(`Evidencias_${docTitle}`);
+        if (carpetaId) {
+          console.log(`Eliminando carpeta de evidencias de "${docTitle}"`);
+          await drive.files.delete({ fileId: carpetaId, supportsAllDrives: true });
         }
       } catch (err) {
         // No dejamos que un fallo aquí impida borrar el documento principal.
-        console.error(`No se pudo eliminar la carpeta de evidencias "${nombreCarpeta}":`, mensajeErrorGoogle(err));
+        console.error(`No se pudo eliminar la carpeta de evidencias de "${docTitle}":`, mensajeErrorGoogle(err));
       }
     }
 
-    // 3. Eliminar el documento de la jornada en sí.
+    // 3. Borrar el archivo de metadatos asociado, si existe.
+    if (metaFileId) {
+      try {
+        await drive.files.delete({ fileId: metaFileId, supportsAllDrives: true });
+      } catch (err) {
+        console.error(`No se pudo eliminar el archivo de metadatos ${metaFileId}:`, mensajeErrorGoogle(err));
+      }
+    }
+
+    // 4. Eliminar el documento de la jornada en sí.
     await drive.files.delete({ fileId: id, supportsAllDrives: true });
     console.log('Documento eliminado con éxito.');
     res.status(200).json({ message: 'Jornada eliminada de Google Drive con éxito.' });
