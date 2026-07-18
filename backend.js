@@ -304,6 +304,42 @@ app.delete('/api/jornadas/:id', async (req, res) => {
   const { id } = req.params;
   console.log(`Solicitud para eliminar el documento con ID: ${id}`);
   try {
+    // 1. Averiguar el nombre del documento (ej: "2025-01-15_Aseo-y-ornato") para poder
+    // encontrar su carpeta de evidencias, que se llama "Evidencias_<ese mismo nombre>".
+    let docTitle = null;
+    try {
+      const archivo = await drive.files.get({
+        fileId: id,
+        fields: 'name',
+        supportsAllDrives: true,
+      });
+      docTitle = archivo.data.name;
+    } catch (err) {
+      console.error(`No se pudo obtener el nombre del documento ${id} (puede que ya no exista):`, mensajeErrorGoogle(err));
+    }
+
+    // 2. Buscar y borrar la carpeta "Evidencias_<docTitle>" dentro de la carpeta principal, si existe.
+    if (docTitle) {
+      const nombreCarpeta = `Evidencias_${docTitle}`;
+      try {
+        const busqueda = await drive.files.list({
+          q: `'${DRIVE_FOLDER_ID}' in parents and mimeType='application/vnd.google-apps.folder' and name='${nombreCarpeta.replace(/'/g, "\\'")}' and trashed=false`,
+          fields: 'files(id, name)',
+          supportsAllDrives: true,
+          includeItemsFromAllDrives: true,
+          corpora: 'allDrives',
+        });
+        for (const carpeta of busqueda.data.files) {
+          console.log(`Eliminando carpeta de evidencias: ${carpeta.name} (${carpeta.id})`);
+          await drive.files.delete({ fileId: carpeta.id, supportsAllDrives: true });
+        }
+      } catch (err) {
+        // No dejamos que un fallo aquí impida borrar el documento principal.
+        console.error(`No se pudo eliminar la carpeta de evidencias "${nombreCarpeta}":`, mensajeErrorGoogle(err));
+      }
+    }
+
+    // 3. Eliminar el documento de la jornada en sí.
     await drive.files.delete({ fileId: id, supportsAllDrives: true });
     console.log('Documento eliminado con éxito.');
     res.status(200).json({ message: 'Jornada eliminada de Google Drive con éxito.' });
